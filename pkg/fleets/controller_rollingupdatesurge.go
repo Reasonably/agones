@@ -19,25 +19,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
-// rollingUpdateActiveSurge returns the replica count for the active GameServerSet when the
-// RollingUpdateSurge feature is enabled. base is the replica count computed without the feature.
-//
-// It follows the Kubernetes Deployment definition of maxSurge: the active GameServerSet may grow
-// until all GameServerSets together hold fleet.Spec.Replicas + maxSurge GameServers, and never
-// beyond fleet.Spec.Replicas on its own. Without this, a Fleet whose inactive GameServerSets are
-// mostly Allocated starts the new GameServerSet with only as many GameServers as the inactive
-// ones have unallocated, so very few new GameServers become Ready and the Ready based scale down
-// of the inactive GameServerSets cannot proceed while the Fleet is growing.
-//
-// base can keep or lower the current target, e.g. when the Fleet is scaled down, but only the
-// surge budget raises it, so a target already above the budget is kept rather than cut.
-//
-// It is also applied once the inactive GameServerSets have been scaled to zero. Falling back to
-// base at that point would delete the GameServers started by the surge in one step, Ready ones
-// included; instead they are released as the Fleet replicas decrease.
-func (c *Controller) rollingUpdateActiveSurge(fleet *agonesv1.Fleet, active *agonesv1.GameServerSet, rest []*agonesv1.GameServerSet, base int32) (int32, error) {
+// rollingUpdateActiveSurge uses the same budget before and after inactive GameServerSets reach
+// zero desired replicas. Existing targets may be retained above that budget, but cannot grow
+// beyond it; the Fleet target still limits retention when the Fleet is scaled down.
+func (c *Controller) rollingUpdateActiveSurge(fleet *agonesv1.Fleet, active *agonesv1.GameServerSet, rest []*agonesv1.GameServerSet) (int32, error) {
 	if fleet.Spec.Replicas == 0 {
-		return base, nil
+		return 0, nil
 	}
 
 	// while the active GameServerSet is still creating GameServers, hold its current target so
@@ -58,9 +45,14 @@ func (c *Controller) rollingUpdateActiveSurge(fleet *agonesv1.Fleet, active *ago
 	restReplicas := agonesv1.SumGameServerSets(rest, func(gsSet *agonesv1.GameServerSet) int32 {
 		return max(gsSet.Spec.Replicas, gsSet.Status.Replicas)
 	})
+	blocked := agonesv1.SumGameServerSets(rest, func(gsSet *agonesv1.GameServerSet) int32 {
+		return gsSet.Status.AllocatedReplicas + gsSet.Status.ReservedReplicas
+	})
 
 	surged := fleet.LowerBoundReplicas(fleet.UpperBoundReplicas(fleet.Spec.Replicas + surge - restReplicas))
-	replicas := max(min(base, active.Spec.Replicas), surged)
+	// Retain the current target without preventing an explicit Fleet scale down.
+	retained := max(min(active.Spec.Replicas, fleet.Spec.Replicas-blocked), 0)
+	replicas := max(retained, surged)
 
 	loggerForFleet(fleet, c.baseLogger).WithField("gameserverset", active.ObjectMeta.Name).WithField("replicas", replicas).
 		WithField("surge", surge).WithField("restReplicas", restReplicas).

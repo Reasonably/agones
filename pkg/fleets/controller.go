@@ -421,6 +421,10 @@ func (c *Controller) applyDeploymentStrategy(ctx context.Context, fleet *agonesv
 		return fleet.Spec.Replicas, nil
 	}
 
+	if runtime.FeatureEnabled(runtime.FeatureRollingUpdateSurge) && fleet.Spec.Strategy.Type == appsv1.RollingUpdateDeploymentStrategyType {
+		return c.rollingUpdateDeployment(ctx, fleet, active, rest)
+	}
+
 	// if we do have `rest` but all their spec.replicas is zero, we can just do subtraction against whatever is allocated in `rest`.
 	if agonesv1.SumGameServerSets(rest, func(gsSet *agonesv1.GameServerSet) int32 {
 		return gsSet.Spec.Replicas
@@ -428,13 +432,7 @@ func (c *Controller) applyDeploymentStrategy(ctx context.Context, fleet *agonesv
 		blocked := agonesv1.SumGameServerSets(rest, func(gsSet *agonesv1.GameServerSet) int32 {
 			return gsSet.Status.ReservedReplicas + gsSet.Status.AllocatedReplicas
 		})
-		replicas := max(fleet.Spec.Replicas-blocked, 0)
-		// Keep applying the surge after the inactive GameServerSets reach zero, otherwise the
-		// GameServers started by the surge are deleted in one step, Ready ones included.
-		if runtime.FeatureEnabled(runtime.FeatureRollingUpdateSurge) && fleet.Spec.Strategy.Type == appsv1.RollingUpdateDeploymentStrategyType {
-			return c.rollingUpdateActiveSurge(fleet, active, rest, replicas)
-		}
-		return replicas, nil
+		return max(fleet.Spec.Replicas-blocked, 0), nil
 	}
 
 	switch fleet.Spec.Strategy.Type {
@@ -495,12 +493,6 @@ func (c *Controller) rollingUpdateDeployment(ctx context.Context, fleet *agonesv
 	if err != nil {
 		return 0, err
 	}
-	if runtime.FeatureEnabled(runtime.FeatureRollingUpdateSurge) {
-		replicas, err = c.rollingUpdateActiveSurge(fleet, active, rest, replicas)
-		if err != nil {
-			return 0, err
-		}
-	}
 	if err := c.rollingUpdateRest(ctx, fleet, active, rest); err != nil {
 		return 0, err
 	}
@@ -510,6 +502,10 @@ func (c *Controller) rollingUpdateDeployment(ctx context.Context, fleet *agonesv
 // rollingUpdateActive applies the rolling update to the active GameServerSet
 // and returns what its replica value should be set to
 func (c *Controller) rollingUpdateActive(fleet *agonesv1.Fleet, active *agonesv1.GameServerSet, rest []*agonesv1.GameServerSet) (int32, error) {
+	if runtime.FeatureEnabled(runtime.FeatureRollingUpdateSurge) {
+		return c.rollingUpdateActiveSurge(fleet, active, rest)
+	}
+
 	replicas := active.Spec.Replicas
 	// always leave room for Allocated GameServers
 	sumAllocated := agonesv1.SumGameServerSets(rest, func(gsSet *agonesv1.GameServerSet) int32 {
