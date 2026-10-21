@@ -429,6 +429,11 @@ func (c *Controller) applyDeploymentStrategy(ctx context.Context, fleet *agonesv
 			return gsSet.Status.ReservedReplicas + gsSet.Status.AllocatedReplicas
 		})
 		replicas := max(fleet.Spec.Replicas-blocked, 0)
+		// Keep applying the surge after the inactive GameServerSets reach zero, otherwise the
+		// GameServers started by the surge are deleted in one step, Ready ones included.
+		if runtime.FeatureEnabled(runtime.FeatureRollingUpdateSurge) && fleet.Spec.Strategy.Type == appsv1.RollingUpdateDeploymentStrategyType {
+			return c.rollingUpdateActiveSurge(fleet, active, rest, replicas)
+		}
 		return replicas, nil
 	}
 
@@ -489,6 +494,12 @@ func (c *Controller) rollingUpdateDeployment(ctx context.Context, fleet *agonesv
 	replicas, err := c.rollingUpdateActive(fleet, active, rest)
 	if err != nil {
 		return 0, err
+	}
+	if runtime.FeatureEnabled(runtime.FeatureRollingUpdateSurge) {
+		replicas, err = c.rollingUpdateActiveSurge(fleet, active, rest, replicas)
+		if err != nil {
+			return 0, err
+		}
 	}
 	if err := c.rollingUpdateRest(ctx, fleet, active, rest); err != nil {
 		return 0, err
