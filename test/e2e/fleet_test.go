@@ -579,34 +579,26 @@ func TestFleetRollingUpdate(t *testing.T) {
 	}
 }
 
-// TestFleetRollingUpdateWithBlockedInactiveGameServerSet rolls out a Fleet with two inactive
-// GameServerSets: the oldest one is held above its target by Allocated GameServers, and the newer
-// one still has Ready GameServers to scale down. The inactive GameServerSets are scaled down in the
-// order the lister returns them, and the scale down stops at the first one whose Spec.Replicas differ
-// from its Status.Replicas, so the Ready GameServers are only scaled down on the syncs where the
-// blocked GameServerSet comes after them.
-//
-// The test logs every change of the newer inactive GameServerSet and how long it took to scale down,
-// so runs with and without a fix can be compared.
+// TestFleetRollingUpdateWithBlockedInactiveGameServerSet checks that the Ready GameServers of an inactive
+// GameServerSet are scaled down while an older inactive GameServerSet is held above its target by
+// Allocated GameServers, whatever the order the inactive GameServerSets are listed in.
 func TestFleetRollingUpdateWithBlockedInactiveGameServerSet(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	client := framework.AgonesClient.AgonesV1()
 	log := e2e.TestLogger(t)
 
-	const (
-		replicas  = 40
-		allocated = 20
-	)
-
 	flt := defaultFleet(framework.Namespace)
-	flt.Spec.Replicas = replicas
+	flt.Spec.Replicas = 40
 	flt.Spec.Template.ObjectMeta.Labels = map[string]string{"version": "v1"}
 	flt, err := client.Fleets(framework.Namespace).Create(ctx, flt, metav1.CreateOptions{})
 	require.NoError(t, err)
 	defer client.Fleets(framework.Namespace).Delete(ctx, flt.ObjectMeta.Name, metav1.DeleteOptions{}) //nolint:errcheck
 
-	framework.AssertFleetCondition(t, flt, e2e.FleetReadyCount(replicas))
+	framework.AssertFleetCondition(t, flt, e2e.FleetReadyCount(flt.Spec.Replicas))
+
+	// Allocate half of the Fleet, so the old GameServerSet keeps Allocated GameServers through the rolling updates.
+	const allocated = 20
 	for range allocated {
 		framework.CreateAndApplyAllocation(t, flt)
 	}
@@ -615,111 +607,69 @@ func TestFleetRollingUpdateWithBlockedInactiveGameServerSet(t *testing.T) {
 	})
 
 	selector := labels.SelectorFromSet(labels.Set{agonesv1.FleetNameLabel: flt.ObjectMeta.Name})
-	// gameServerSet returns the GameServerSet of the given template version, or nil if there is none.
-	gameServerSet := func(version string) (*agonesv1.GameServerSet, error) {
+	// returns the GameServerSets of the Fleet by their template version
+	listGameServerSets := func() (map[string]*agonesv1.GameServerSet, error) {
 		list, err := client.GameServerSets(framework.Namespace).List(ctx, metav1.ListOptions{LabelSelector: selector.String()})
 		if err != nil {
 			return nil, err
 		}
+		gsSets := map[string]*agonesv1.GameServerSet{}
 		for i := range list.Items {
-			if list.Items[i].Spec.Template.ObjectMeta.Labels["version"] == version {
-				return &list.Items[i], nil
-			}
+			gsSets[list.Items[i].Spec.Template.ObjectMeta.Labels["version"]] = &list.Items[i]
 		}
-		return nil, nil
-	}
-	describe := func(gsSet *agonesv1.GameServerSet) string {
-		if gsSet == nil {
-			return "deleted"
-		}
-		return fmt.Sprintf("spec=%d replicas=%d ready=%d allocated=%d reserved=%d shutdown=%d", gsSet.Spec.Replicas,
-			gsSet.Status.Replicas, gsSet.Status.ReadyReplicas, gsSet.Status.AllocatedReplicas, gsSet.Status.ReservedReplicas,
-			gsSet.Status.ShutdownReplicas)
+		return gsSets, nil
 	}
 	updateVersion := func(version string) {
 		require.NoError(t, retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			current, err := client.Fleets(framework.Namespace).Get(ctx, flt.ObjectMeta.Name, metav1.GetOptions{})
+			flt, err = client.Fleets(framework.Namespace).Get(ctx, flt.ObjectMeta.GetName(), metav1.GetOptions{})
 			if err != nil {
 				return err
 			}
-			current.Spec.Template.ObjectMeta.Labels["version"] = version
-			_, err = client.Fleets(framework.Namespace).Update(ctx, current, metav1.UpdateOptions{})
+			fltCopy := flt.DeepCopy()
+			fltCopy.Spec.Template.ObjectMeta.Labels["version"] = version
+			_, err = client.Fleets(framework.Namespace).Update(ctx, fltCopy, metav1.UpdateOptions{})
 			return err
 		}))
 	}
 
-	// Rolling out v2 scales v1 down by maxUnavailable at a time. Once only a few Ready GameServers are
-	// left in v1, a scale down step can be larger than them, so v1 ends up with a target below its
-	// Allocated GameServers and keeps them above it.
+	// Once only a few Ready GameServers are left in v1, a scale down step can be larger than them, so v1
+	// ends up with a target below its Allocated GameServers.
 	updateVersion("v2")
-	var v1 *agonesv1.GameServerSet
 	require.Eventually(t, func() bool {
-		v1, err = gameServerSet("v1")
-		if err != nil || v1 == nil {
+		gsSets, err := listGameServerSets()
+		if err != nil {
+			log.WithError(err).Error("Should be able to list")
 			return false
 		}
-		log.WithField("v1", describe(v1)).Info("Waiting for v1 to settle")
-		return v1.Spec.Replicas == 0 || v1.Status.Replicas == v1.Status.AllocatedReplicas+v1.Status.ReservedReplicas
-	}, 5*time.Minute, time.Second, "v1 should only have its Allocated GameServers left")
-	require.Greater(t, v1.Spec.Replicas, int32(0), "v1 was scaled to zero without being held above its target, so the scenario was not reached: %s", describe(v1))
-	require.Less(t, v1.Spec.Replicas, v1.Status.Replicas, "v1 should be held above its target: %s", describe(v1))
-
-	// wait for v2 to have all its GameServers Ready, so it has Ready GameServers to scale down in the next rollout
-	var v2 *agonesv1.GameServerSet
-	require.Eventually(t, func() bool {
-		v2, err = gameServerSet("v2")
-		if err != nil || v2 == nil {
+		v1, v2 := gsSets["v1"], gsSets["v2"]
+		if v1 == nil || v2 == nil {
 			return false
 		}
-		log.WithField("v2", describe(v2)).Info("Waiting for v2 to be Ready")
-		return v2.Spec.Replicas >= replicas-allocated && v2.Spec.Replicas == v2.Status.Replicas && v2.Spec.Replicas == v2.Status.ReadyReplicas
-	}, 5*time.Minute, time.Second, "v2 should have all its GameServers Ready")
+		log.WithField("v1", fmt.Sprintf("%d %+v", v1.Spec.Replicas, v1.Status)).WithField("v2", fmt.Sprintf("%d %+v", v2.Spec.Replicas, v2.Status)).
+			Info("Checking GameServerSets after updating to v2")
+		return v1.Spec.Replicas > 0 && v1.Spec.Replicas < v1.Status.Replicas && v1.Status.Replicas == v1.Status.AllocatedReplicas &&
+			v2.Spec.Replicas > 0 && v2.Spec.Replicas == v2.Status.Replicas && v2.Spec.Replicas == v2.Status.ReadyReplicas
+	}, 5*time.Minute, time.Second, "v1 should be held above its target by Allocated GameServers, and v2 should be Ready")
 
-	// Roll out v3 and record how the Ready GameServers of v2 are scaled down while v1 stays blocked.
+	// v1 stays above its target, so v2 has to be scaled down around it.
 	updateVersion("v3")
-	start := time.Now()
-	lastChange := start
-	lastReport := start
-	longestWait := time.Duration(0)
-	steps := 0
-	previous := v2.Spec.Replicas
 	require.Eventually(t, func() bool {
-		blocked, err := gameServerSet("v1")
+		gsSets, err := listGameServerSets()
 		if err != nil {
+			log.WithError(err).Error("Should be able to list")
 			return false
 		}
-		draining, err := gameServerSet("v2")
-		if err != nil {
+		v2, v3 := gsSets["v2"], gsSets["v3"]
+		if v3 == nil {
 			return false
 		}
-		active, err := gameServerSet("v3")
-		if err != nil {
+		if v2 != nil {
+			log.WithField("v2", fmt.Sprintf("%d %+v", v2.Spec.Replicas, v2.Status)).WithField("v3", fmt.Sprintf("%d %+v", v3.Spec.Replicas, v3.Status)).
+				Info("Checking GameServerSets after updating to v3")
 			return false
 		}
-		current := int32(0)
-		if draining != nil {
-			current = draining.Spec.Replicas
-		}
-		now := time.Now()
-		entry := log.WithField("elapsed", now.Sub(start).Round(time.Second)).WithField("waited", now.Sub(lastChange).Round(time.Second)).
-			WithField("v1", describe(blocked)).WithField("v2", describe(draining)).WithField("v3", describe(active))
-		switch {
-		case current != previous:
-			longestWait = max(longestWait, now.Sub(lastChange))
-			entry.Info("v2 scaled down")
-			lastChange = now
-			lastReport = now
-			previous = current
-			steps++
-		case now.Sub(lastReport) >= 30*time.Second:
-			entry.Info("v2 not scaled down yet")
-			lastReport = now
-		}
-		return draining == nil || (draining.Spec.Replicas == 0 && draining.Status.Replicas == 0)
-	}, 15*time.Minute, time.Second, "v2 should be scaled down")
-
-	log.WithField("duration", time.Since(start).Round(time.Second)).WithField("steps", steps).
-		WithField("longestWait", longestWait.Round(time.Second)).Info("v2 scaled down to zero")
+		return v3.Status.ReadyReplicas >= flt.Spec.Replicas-allocated
+	}, 2*time.Minute, time.Second, "v2 should be scaled down while v1 is held above its target")
 }
 
 func TestUpdateFleetReplicaAndSpec(t *testing.T) {
